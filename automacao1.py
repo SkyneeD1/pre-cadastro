@@ -19,6 +19,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
+from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
 
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
@@ -330,18 +331,56 @@ def clicar_elemento_por_sufixo(suffix, tag="button"):
     time.sleep(0.3)  # REDUZIDO
 
 def preencher_input_por_sufixo(suffix, valor, tag="input"):
-    """Preenche input pelo sufixo do ID"""
+    """Preenche input pelo sufixo do ID com o mínimo de esperas possíveis"""
     if valor == "" and valor != 0:
         return
-    elem = wait_element_by_id_suffix(suffix, tag)
+
+    elem = wait_element_by_id_suffix(suffix, tag, condition=EC.element_to_be_clickable)
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
-    elem.click()
-    time.sleep(0.15)  # REDUZIDO
-    elem.send_keys(Keys.CONTROL, "a")
-    elem.send_keys(Keys.BACKSPACE)
-    time.sleep(0.15)  # REDUZIDO
-    elem.send_keys(str(valor))
-    time.sleep(0.3)  # REDUZIDO
+
+    value_str = str(valor)
+
+    try:
+        # Usa JavaScript para limpar e preencher rapidamente o campo
+        driver.execute_script(
+            "arguments[0].focus();"
+            "arguments[0].value = '';"
+            "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
+            elem,
+        )
+        driver.execute_script(
+            "arguments[0].value = arguments[1];"
+            "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));"
+            "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
+            elem,
+            value_str,
+        )
+
+        WebDriverWait(driver, 4).until(
+            lambda d: driver.execute_script("return arguments[0].value;", elem) == value_str
+        )
+    except Exception:
+        # Fallback: usa send_keys caso o JavaScript falhe
+        try:
+            elem.click()
+            elem.send_keys(Keys.CONTROL, "a")
+            elem.send_keys(Keys.BACKSPACE)
+            elem.send_keys(value_str)
+            WebDriverWait(driver, 4).until(
+                lambda d: driver.execute_script("return arguments[0].value;", elem) == value_str
+            )
+        except StaleElementReferenceException:
+            # Reobtém o elemento e tenta novamente apenas uma vez
+            elem = wait_element_by_id_suffix(suffix, tag, condition=EC.element_to_be_clickable)
+            elem.clear()
+            elem.send_keys(value_str)
+        finally:
+            try:
+                WebDriverWait(driver, 2).until(
+                    lambda d: driver.execute_script("return arguments[0].value;", elem) == value_str
+                )
+            except Exception:
+                pass
 
 def digitar_data_humano_por_sufixo(suffix, data_valor):
     """Digita data em modo humano pelo sufixo do ID"""
@@ -393,37 +432,55 @@ def esperar_texto_em_tabela_outras_partes(texto, timeout=WAIT_MEDIUM):
 # FUNÇÕES AUTCOMPLETE SIMPLIFICADAS
 # =====================
 def preencher_autocomplete_simples(suffix, valor, tag="input"):
-    """
-    Preenche autocomplete de forma simples: digita, espera 3s, aperta ENTER
-    """
+    """Preenche autocomplete aguardando a lista abrir em vez de usar sleeps longos"""
     if not valor:
         return True
-        
+
+    panel_selector = "div.ui-autocomplete-panel[style*='display: block']"
+
     try:
         elem = wait_element_by_id_suffix(suffix, tag, condition=EC.element_to_be_clickable)
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
         elem.click()
-        time.sleep(0.15)  # REDUZIDO
-        
-        # Limpa campo
-        elem.send_keys(Keys.CONTROL + "a")
+
+        elem.send_keys(Keys.CONTROL, "a")
         elem.send_keys(Keys.BACKSPACE)
-        time.sleep(0.25)  # REDUZIDO
-        
-        # Digita o valor
+
         elem.send_keys(valor)
         print(f"✍️ Digitando '{valor}' no autocomplete...")
-        
-        # Espera 2 segundos para o sistema processar (REDUZIDO)
-        time.sleep(2.0)
-        
-        # Aperta ENTER para confirmar
-        elem.send_keys(Keys.ENTER)
-        time.sleep(0.4)  # REDUZIDO
-        
+
+        panel = WebDriverWait(driver, 5).until(
+            EC.visibility_of_element_located((By.CSS_SELECTOR, panel_selector))
+        )
+
+        literal = _xpath_literal(valor)
+        option_locator = (
+            By.XPATH,
+            f"//div[contains(@class,'ui-autocomplete-panel') and contains(@style,'display: block')]//li[normalize-space(.)={literal} and not(contains(@class,'ui-state-disabled'))]",
+        )
+
+        try:
+            option = WebDriverWait(driver, 3).until(EC.element_to_be_clickable(option_locator))
+        except TimeoutException:
+            option = WebDriverWait(driver, 3).until(
+                EC.element_to_be_clickable(
+                    (
+                        By.XPATH,
+                        "//div[contains(@class,'ui-autocomplete-panel') and contains(@style,'display: block')]//li[not(contains(@class,'ui-state-disabled'))]",
+                    )
+                )
+            )
+
+        driver.execute_script("arguments[0].scrollIntoView({block:'nearest'});", option)
+        driver.execute_script("arguments[0].click();", option)
+
+        WebDriverWait(driver, 4).until(
+            lambda d: driver.execute_script("return arguments[0].value;", elem).strip() != ""
+        )
+
         print(f"✅ Autocomplete preenchido: {valor}")
         return True
-        
+
     except Exception as e:
         print(f"❌ Erro no autocomplete '{valor}': {e}")
         return False
@@ -443,45 +500,96 @@ def _ajusta_valor_para_estado(label_id, valor):
     return valor
 
 def selecionar_primefaces_por_sufixo(suffix, valor, timeout=WAIT_LONG):
-    """Seleciona em dropdown PrimeFaces pelo sufixo do ID - MESMA LÓGICA QUE JÁ FUNCIONA"""
+    """Seleciona em dropdown PrimeFaces com foco em velocidade."""
     valor = _ajusta_valor_para_estado(suffix, (valor or "").strip())
-    
-    # Encontrar o label pelo sufixo
+    alvo_normalizado = valor.split(" -")[0].strip().lower() if valor else ""
+
     label = wait_element_by_id_suffix(suffix, "span", condition=EC.element_to_be_clickable)
+    texto_atual = (label.text or "").strip().lower()
+    if alvo_normalizado and alvo_normalizado in texto_atual:
+        return True
+
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", label)
     driver.execute_script("arguments[0].click();", label)
-    time.sleep(0.2)  # REDUZIDO
-    
-    # Esperar panel abrir
+
     panel = WebDriverWait(driver, timeout).until(
-        EC.visibility_of_element_located((By.XPATH, "//div[contains(@class,'ui-selectonemenu-panel') and contains(@style,'display: block')]"))
+        EC.visibility_of_element_located((By.CSS_SELECTOR, "div.ui-selectonemenu-panel[style*='display: block']"))
     )
-    
+
+    filtro = None
     try:
-        # Tentar usar filtro se existir - MESMO MÉTODO QUE JÁ FUNCIONA
         filtro = panel.find_element(By.XPATH, ".//input[contains(@id,'_filter')]")
-        filtro.clear()
+    except Exception:
+        filtro = None
+
+    if filtro is not None:
+        filtro.click()
+        filtro.send_keys(Keys.CONTROL, "a")
+        filtro.send_keys(Keys.BACKSPACE)
         if valor:
             filtro.send_keys(valor)
-        time.sleep(0.5)  # REDUZIDO
+
+        try:
+            WebDriverWait(driver, 2).until(
+                EC.presence_of_element_located(
+                    (
+                        By.CSS_SELECTOR,
+                        "div.ui-selectonemenu-panel[style*='display: block'] li:not(.ui-state-disabled)",
+                    )
+                )
+            )
+        except TimeoutException:
+            pass
+
         filtro.send_keys(Keys.ENTER)
-        time.sleep(0.25)  # REDUZIDO
-        return True
-    except Exception:
-        # Fallback: selecionar primeiro item não desabilitado - MESMO MÉTODO QUE JÁ FUNCIONA
-        js = """
-        var panel = document.querySelector("div.ui-selectonemenu-panel[style*='display: block']");
-        if (panel) {
-            var item = panel.querySelector("li:not(.ui-state-disabled)");
-            if (item) { item.click(); return true; }
-        }
-        return false;
-        """
-        ok = driver.execute_script(js)
-        if ok:
-            time.sleep(0.2)  # REDUZIDO
-            return True
-        raise Exception(f"Não foi possível selecionar no dropdown com sufixo {suffix}")
+    else:
+        option = None
+        if valor:
+            literal = _xpath_literal(valor)
+            for locator in (
+                (
+                    By.XPATH,
+                    f"//div[contains(@class,'ui-selectonemenu-panel') and contains(@style,'display: block')]//li[@data-label and normalize-space(@data-label)={literal} and not(contains(@class,'ui-state-disabled'))]",
+                ),
+                (
+                    By.XPATH,
+                    f"//div[contains(@class,'ui-selectonemenu-panel') and contains(@style,'display: block')]//li[normalize-space(.)={literal} and not(contains(@class,'ui-state-disabled'))]",
+                ),
+            ):
+                try:
+                    option = WebDriverWait(driver, 2).until(EC.element_to_be_clickable(locator))
+                    break
+                except TimeoutException:
+                    continue
+
+        if option is None:
+            option = WebDriverWait(driver, 2).until(
+                EC.element_to_be_clickable(
+                    (
+                        By.CSS_SELECTOR,
+                        "div.ui-selectonemenu-panel[style*='display: block'] li:not(.ui-state-disabled)",
+                    )
+                )
+            )
+
+        driver.execute_script("arguments[0].scrollIntoView({block:'nearest'});", option)
+        driver.execute_script("arguments[0].click();", option)
+
+    try:
+        WebDriverWait(driver, 3).until(EC.invisibility_of_element(panel))
+    except TimeoutException:
+        pass
+
+    if valor:
+        try:
+            atualizado = wait_element_by_id_suffix(suffix, "span")
+            WebDriverWait(driver, 2).until(
+                lambda d: alvo_normalizado in ((atualizado.text or "").strip().lower())
+            )
+        except TimeoutException:
+            pass
+
+    return True
 
 # =====================
 # FUNÇÃO ESPECÍFICA PARA PRÉ-CADASTRO - BASEADA NO TESTE QUE FUNCIONOU
